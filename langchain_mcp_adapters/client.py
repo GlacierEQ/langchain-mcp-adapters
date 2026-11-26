@@ -1,7 +1,8 @@
-"""Client for connecting to multiple MCP servers and loading LangChain tools/resources.
+"""Client for connecting to multiple MCP servers and loading LC tools/resources.
 
-This module provides the MultiServerMCPClient class for managing connections to multiple
-MCP servers and loading tools, prompts, and resources from them.
+This module provides the `MultiServerMCPClient` class for managing connections
+to multiple MCP servers and loading tools, prompts, resources, and server info
+from them.
 """
 
 import asyncio
@@ -14,9 +15,13 @@ from langchain_core.documents.base import Blob
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import BaseTool
 from mcp import ClientSession
+from mcp.types import InitializeResult
 
+from langchain_mcp_adapters.callbacks import CallbackContext, Callbacks
+from langchain_mcp_adapters.interceptors import ToolCallInterceptor
 from langchain_mcp_adapters.prompts import load_mcp_prompt
 from langchain_mcp_adapters.resources import load_mcp_resources
+from langchain_mcp_adapters.server_info import load_mcp_server_info
 from langchain_mcp_adapters.sessions import (
     Connection,
     McpHttpClientFactory,
@@ -43,55 +48,82 @@ ASYNC_CONTEXT_MANAGER_ERROR = (
 class MultiServerMCPClient:
     """Client for connecting to multiple MCP servers.
 
-    Loads LangChain-compatible tools, prompts and resources from MCP servers.
+    Loads LangChain-compatible tools, prompts and resources from MCP servers, and
+    retrieves server info from them.
     """
 
-    def __init__(self, connections: dict[str, Connection] | None = None) -> None:
-        """Initialize a MultiServerMCPClient with MCP servers connections.
+    def __init__(
+        self,
+        connections: dict[str, Connection] | None = None,
+        *,
+        callbacks: Callbacks | None = None,
+        tool_interceptors: list[ToolCallInterceptor] | None = None,
+        tool_name_prefix: bool = False,
+        handle_tool_errors: bool = True,
+    ) -> None:
+        """Initialize a `MultiServerMCPClient` with MCP servers connections.
 
         Args:
-            connections: A dictionary mapping server names to connection configurations.
-                If None, no initial connections are established.
+            connections: A `dict` mapping server names to connection configurations. If
+                `None`, no initial connections are established.
+            callbacks: Optional callbacks for handling notifications and events.
+            tool_interceptors: Optional list of tool call interceptors for modifying
+                requests and responses.
+            tool_name_prefix: If `True`, tool names are prefixed with the server name
+                using an underscore separator (e.g., `"weather_search"` instead of
+                `"search"`). This helps avoid conflicts when multiple servers have tools
+                with the same name. Defaults to `False`.
+            handle_tool_errors: If `True` (default), an MCP tool execution error
+                (`CallToolResult(isError=True)`) is returned to the model as a
+                `ToolMessage` with `status="error"` so the agent can self-correct
+                instead of crashing the run. If `False`, a `ToolException` is
+                raised instead (legacy behavior). Transport/session failures and
+                content-conversion errors (e.g. unsupported audio content) always
+                raise regardless of this setting; only MCP execution errors
+                (`isError=True`) are governed by it.
 
-        Example: basic usage (starting a new session on each tool call)
+        !!! example "Basic usage (starting a new session on each tool call)"
 
-        ```python
-        from langchain_mcp_adapters.client import MultiServerMCPClient
+            ```python
+            from langchain_mcp_adapters.client import MultiServerMCPClient
 
-        client = MultiServerMCPClient(
-            {
-                "math": {
-                    "command": "python",
-                    # Make sure to update to the full absolute path to your
-                    # math_server.py file
-                    "args": ["/path/to/math_server.py"],
-                    "transport": "stdio",
-                },
-                "weather": {
-                    # Make sure you start your weather server on port 8000
-                    "url": "http://localhost:8000/mcp",
-                    "transport": "streamable_http",
+            client = MultiServerMCPClient(
+                {
+                    "math": {
+                        "command": "python",
+                        # Make sure to update to the full absolute path to your
+                        # math_server.py file
+                        "args": ["/path/to/math_server.py"],
+                        "transport": "stdio",
+                    },
+                    "weather": {
+                        # Make sure you start your weather server on port 8000
+                        "url": "http://localhost:8000/mcp",
+                        "transport": "http",
+                    }
                 }
-            }
-        )
-        all_tools = await client.get_tools()
-        ```
+            )
+            all_tools = await client.get_tools()
+            ```
 
-        Example: explicitly starting a session
+        !!! example "Explicitly starting a session"
 
-        ```python
-        from langchain_mcp_adapters.client import MultiServerMCPClient
-        from langchain_mcp_adapters.tools import load_mcp_tools
+            ```python
+            from langchain_mcp_adapters.client import MultiServerMCPClient
+            from langchain_mcp_adapters.tools import load_mcp_tools
 
-        client = MultiServerMCPClient({...})
-        async with client.session("math") as session:
-            tools = await load_mcp_tools(session)
-        ```
-
+            client = MultiServerMCPClient({...})
+            async with client.session("math") as session:
+                tools = await load_mcp_tools(session)
+            ```
         """
         self.connections: dict[str, Connection] = (
             connections if connections is not None else {}
         )
+        self.callbacks = callbacks or Callbacks()
+        self.tool_interceptors = tool_interceptors or []
+        self.tool_name_prefix = tool_name_prefix
+        self.handle_tool_errors = handle_tool_errors
 
     @asynccontextmanager
     async def session(
@@ -110,7 +142,7 @@ class MultiServerMCPClient:
             ValueError: If the server name is not found in the connections
 
         Yields:
-            An initialized ClientSession
+            An initialized `ClientSession`
 
         """
         if server_name not in self.connections:
@@ -120,7 +152,13 @@ class MultiServerMCPClient:
             )
             raise ValueError(msg)
 
-        async with create_session(self.connections[server_name]) as session:
+        mcp_callbacks = self.callbacks.to_mcp_format(
+            context=CallbackContext(server_name=server_name)
+        )
+
+        async with create_session(
+            self.connections[server_name], mcp_callbacks=mcp_callbacks
+        ) as session:
             if auto_initialize:
                 await session.initialize()
             yield session
@@ -130,12 +168,14 @@ class MultiServerMCPClient:
 
         Args:
             server_name: Optional name of the server to get tools from.
-                If None, all tools from all servers will be returned (default).
+                If `None`, all tools from all servers will be returned.
 
-        NOTE: a new session will be created for each tool call
+        !!! note
+
+            A new session will be created for each tool call
 
         Returns:
-            A list of LangChain tools
+            A list of LangChain [tools](https://docs.langchain.com/oss/python/langchain/tools)
 
         """
         if server_name is not None:
@@ -145,19 +185,119 @@ class MultiServerMCPClient:
                     f"expected one of '{list(self.connections.keys())}'"
                 )
                 raise ValueError(msg)
-            return await load_mcp_tools(None, connection=self.connections[server_name])
+            return await load_mcp_tools(
+                None,
+                connection=self.connections[server_name],
+                callbacks=self.callbacks,
+                server_name=server_name,
+                tool_interceptors=self.tool_interceptors,
+                tool_name_prefix=self.tool_name_prefix,
+                handle_tool_errors=self.handle_tool_errors,
+            )
 
         all_tools: list[BaseTool] = []
         load_mcp_tool_tasks = []
-        for connection in self.connections.values():
+        for name, connection in self.connections.items():
             load_mcp_tool_task = asyncio.create_task(
-                load_mcp_tools(None, connection=connection)
+                load_mcp_tools(
+                    None,
+                    connection=connection,
+                    callbacks=self.callbacks,
+                    server_name=name,
+                    tool_interceptors=self.tool_interceptors,
+                    tool_name_prefix=self.tool_name_prefix,
+                    handle_tool_errors=self.handle_tool_errors,
+                )
             )
             load_mcp_tool_tasks.append(load_mcp_tool_task)
         tools_list = await asyncio.gather(*load_mcp_tool_tasks)
         for tools in tools_list:
             all_tools.extend(tools)
         return all_tools
+
+    async def get_server_info(
+        self,
+        *,
+        server_name: str | None = None,
+    ) -> dict[str, InitializeResult]:
+        """Get server info from MCP server(s).
+
+        Returns the `InitializeResult` for each server, which includes
+        server instructions, capabilities, and implementation details.
+
+        Args:
+            server_name: Optional name of the server to get info from.
+                If `None`, info from all servers will be returned.
+
+        !!! note
+
+            A new temporary session is created for each server on every call and
+            results are not cached, so each call performs a fresh handshake with
+            every server queried (for `stdio` servers, that means starting a new
+            subprocess each time).
+
+        Returns:
+            A dict mapping server names to their `InitializeResult`. Empty if no
+                connections are configured.
+
+        Raises:
+            ValueError: If `server_name` is provided but not found in the
+                connections.
+            RuntimeError: If any queried server fails. Every server is queried
+                and the message names each one that failed; partial results are
+                not returned.
+
+        """
+        if server_name is not None:
+            if server_name not in self.connections:
+                msg = (
+                    f"Couldn't find a server with name '{server_name}', "
+                    f"expected one of '{list(self.connections.keys())}'"
+                )
+                raise ValueError(msg)
+            names = [server_name]
+        else:
+            # Snapshot the names before awaiting: `connections` is public and
+            # mutable, so re-reading it afterwards could misalign names with
+            # results.
+            names = list(self.connections)
+
+        tasks = [
+            asyncio.create_task(
+                load_mcp_server_info(
+                    None,
+                    connection=self.connections[name],
+                    callbacks=self.callbacks,
+                    server_name=name,
+                )
+            )
+            for name in names
+        ]
+        # `return_exceptions=True` lets every task run to completion so each
+        # session unwinds its context manager (tearing down subprocesses and
+        # connections) instead of being orphaned mid-`async with`, and lets the
+        # error below name every server that failed rather than only the first.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        server_info: dict[str, InitializeResult] = {}
+        errors: dict[str, BaseException] = {}
+        for name, result in zip(names, results, strict=True):
+            if isinstance(result, BaseException):
+                errors[name] = result
+            else:
+                server_info[name] = result
+
+        if errors:
+            detail = ", ".join(
+                f"'{name}': {type(exc).__name__}: {exc}" for name, exc in errors.items()
+            )
+            msg = (
+                f"Failed to retrieve server info from {len(errors)} of "
+                f"{len(names)} MCP server(s) - {detail}"
+            )
+            raise RuntimeError(msg) from next(iter(errors.values()))
+
+        return server_info
 
     async def get_prompt(
         self,
@@ -172,23 +312,45 @@ class MultiServerMCPClient:
 
     async def get_resources(
         self,
-        server_name: str,
+        server_name: str | None = None,
         *,
         uris: str | list[str] | None = None,
     ) -> list[Blob]:
-        """Get resources from a given MCP server.
+        """Get resources from MCP server(s).
 
         Args:
-            server_name: Name of the server to get resources from
+            server_name: Optional name of the server to get resources from.
+                If `None`, all resources from all servers will be returned.
             uris: Optional resource URI or list of URIs to load. If not provided,
                 all resources will be loaded.
 
         Returns:
-            A list of LangChain Blobs
+            A list of LangChain [Blob][langchain_core.documents.base.Blob] objects.
 
         """
-        async with self.session(server_name) as session:
-            return await load_mcp_resources(session, uris=uris)
+        if server_name is not None:
+            if server_name not in self.connections:
+                msg = (
+                    f"Couldn't find a server with name '{server_name}', "
+                    f"expected one of '{list(self.connections.keys())}'"
+                )
+                raise ValueError(msg)
+            async with self.session(server_name) as session:
+                return await load_mcp_resources(session, uris=uris)
+
+        async def _load_resources_from_server(name: str) -> list[Blob]:
+            async with self.session(name) as session:
+                return await load_mcp_resources(session, uris=uris)
+
+        all_resources: list[Blob] = []
+        load_tasks = [
+            asyncio.create_task(_load_resources_from_server(name))
+            for name in self.connections
+        ]
+        resources_list = await asyncio.gather(*load_tasks)
+        for resources in resources_list:
+            all_resources.extend(resources)
+        return all_resources
 
     async def __aenter__(self) -> "MultiServerMCPClient":
         """Async context manager entry point.
@@ -218,6 +380,7 @@ class MultiServerMCPClient:
 
 
 __all__ = [
+    "Callbacks",
     "McpHttpClientFactory",
     "MultiServerMCPClient",
     "SSEConnection",

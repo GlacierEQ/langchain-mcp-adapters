@@ -1,15 +1,122 @@
+import logging
 import os
+from collections.abc import Generator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.documents.base import Blob
 from langchain_core.messages import AIMessage
 from langchain_core.tools import BaseTool
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.sessions import _create_stdio_session
 from langchain_mcp_adapters.tools import load_mcp_tools
+from tests.utils import IsLangChainID
 
 
-@pytest.mark.asyncio
+@pytest.fixture
+def mock_stdio_session() -> Generator[dict, None, None]:
+    """Patch stdio_client and ClientSession.
+
+    Yields a dict that captures the StdioServerParameters passed to stdio_client.
+    """
+    captured: dict = {}
+
+    @asynccontextmanager
+    async def fake_stdio_client(params):
+        captured["server_params"] = params
+        yield AsyncMock(), AsyncMock()
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=MagicMock())
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch("langchain_mcp_adapters.sessions.stdio_client", fake_stdio_client),
+        patch(
+            "langchain_mcp_adapters.sessions.ClientSession",
+            return_value=mock_session,
+        ),
+    ):
+        yield captured
+
+
+async def test_stdio_session_expands_env_vars(monkeypatch, mock_stdio_session):
+    """Test that ${VAR} references in the env dict are expanded before spawning."""
+    monkeypatch.setenv("TEST_MCP_TOKEN", "secret123")
+
+    async with _create_stdio_session(
+        command="npx",
+        args=["-y", "@some/mcp-server"],
+        env={
+            "API_TOKEN": "${TEST_MCP_TOKEN}",
+            "LITERAL": "plain",
+            "EMBEDDED": "Bearer ${TEST_MCP_TOKEN}",
+        },
+    ):
+        pass
+
+    resolved_env = mock_stdio_session["server_params"].env
+    assert resolved_env["API_TOKEN"] == "secret123"  # noqa: S105
+    assert resolved_env["LITERAL"] == "plain"
+    assert resolved_env["EMBEDDED"] == "Bearer secret123"
+
+
+async def test_stdio_session_env_none_stays_none(mock_stdio_session):
+    """Test that env=None is passed through as None (inherits parent environment)."""
+    async with _create_stdio_session(command="npx", args=[]):
+        pass
+
+    assert mock_stdio_session["server_params"].env is None
+
+
+async def test_stdio_session_env_empty_dict_stays_empty(mock_stdio_session):
+    """Test that env={} is passed through as {} (not collapsed to None)."""
+    async with _create_stdio_session(command="npx", args=[], env={}):
+        pass
+
+    assert mock_stdio_session["server_params"].env == {}
+
+
+async def test_stdio_session_bare_dollar_not_expanded(monkeypatch, mock_stdio_session):
+    """Bare $VAR references must NOT be expanded — only ${VAR} is supported."""
+    monkeypatch.setenv("word123", "OOPS")
+
+    async with _create_stdio_session(
+        command="npx",
+        args=["-y", "@some/mcp-server"],
+        env={"DB_PASSWORD": "p@ss$word123"},
+    ):
+        pass
+
+    resolved_env = mock_stdio_session["server_params"].env
+    assert resolved_env["DB_PASSWORD"] == "p@ss$word123"  # noqa: S105
+
+
+async def test_stdio_session_warns_on_undefined_env_var(
+    monkeypatch, mock_stdio_session, caplog
+):
+    """Test that undefined ${VAR} references emit a warning."""
+    monkeypatch.delenv("TOTALLY_UNDEFINED_VAR_XYZ", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="langchain_mcp_adapters.sessions"):
+        async with _create_stdio_session(
+            command="npx",
+            args=[],
+            env={"SECRET": "${TOTALLY_UNDEFINED_VAR_XYZ}"},
+        ):
+            pass
+
+    assert "unexpanded variable reference" in caplog.text
+    # Value should pass through as literal when undefined
+    assert (
+        mock_stdio_session["server_params"].env["SECRET"]
+        == "${TOTALLY_UNDEFINED_VAR_XYZ}"  # noqa: S105
+    )
+
+
 async def test_multi_server_mcp_client(
     socket_enabled,
     websocket_server,
@@ -24,12 +131,12 @@ async def test_multi_server_mcp_client(
     client = MultiServerMCPClient(
         {
             "math": {
-                "command": "python",
+                "command": "python3",
                 "args": [math_server_path],
                 "transport": "stdio",
             },
             "weather": {
-                "command": "python",
+                "command": "python3",
                 "args": [weather_server_path],
                 "transport": "stdio",
             },
@@ -72,25 +179,26 @@ async def test_multi_server_mcp_client(
     # Test that we can call a math tool
     add_tool = next(tool for tool in all_tools if tool.name == "add")
     result = await add_tool.ainvoke({"a": 2, "b": 3})
-    assert result == "5"
+    assert result == [{"type": "text", "text": "5", "id": IsLangChainID}]
 
     # Test that we can call a weather tool
     weather_tool = next(tool for tool in all_tools if tool.name == "get_weather")
     result = await weather_tool.ainvoke({"location": "London"})
-    assert result == "It's always sunny in London"
+    assert result == [
+        {"type": "text", "text": "It's always sunny in London", "id": IsLangChainID}
+    ]
 
     # Test the multiply tool
     multiply_tool = next(tool for tool in all_tools if tool.name == "multiply")
     result = await multiply_tool.ainvoke({"a": 4, "b": 5})
-    assert result == "20"
+    assert result == [{"type": "text", "text": "20", "id": IsLangChainID}]
 
     # Test that we can call a time tool
     time_tool = next(tool for tool in all_tools if tool.name == "get_time")
     result = await time_tool.ainvoke({"args": ""})
-    assert result == "5:20:00 PM EST"
+    assert result == [{"type": "text", "text": "5:20:00 PM EST", "id": IsLangChainID}]
 
 
-@pytest.mark.asyncio
 async def test_multi_server_connect_methods(
     socket_enabled,
     websocket_server,
@@ -105,7 +213,7 @@ async def test_multi_server_connect_methods(
     client = MultiServerMCPClient(
         {
             "math": {
-                "command": "python",
+                "command": "python3",
                 "args": [math_server_path],
                 "transport": "stdio",
             },
@@ -120,7 +228,7 @@ async def test_multi_server_connect_methods(
         tools = await load_mcp_tools(session)
         assert len(tools) == 2
         result = await tools[0].ainvoke({"a": 2, "b": 3})
-        assert result == "5"
+        assert result == [{"type": "text", "text": "5", "id": IsLangChainID}]
 
         for tool in tools:
             tool_names.add(tool.name)
@@ -129,7 +237,9 @@ async def test_multi_server_connect_methods(
         tools = await load_mcp_tools(session)
         assert len(tools) == 1
         result = await tools[0].ainvoke({"args": ""})
-        assert result == "5:20:00 PM EST"
+        assert result == [
+            {"type": "text", "text": "5:20:00 PM EST", "id": IsLangChainID}
+        ]
 
         for tool in tools:
             tool_names.add(tool.name)
@@ -137,7 +247,6 @@ async def test_multi_server_connect_methods(
     assert tool_names == {"add", "multiply", "get_time"}
 
 
-@pytest.mark.asyncio
 async def test_get_prompt():
     """Test retrieving prompts from MCP servers."""
     # Get the absolute path to the server scripts
@@ -147,7 +256,7 @@ async def test_get_prompt():
     client = MultiServerMCPClient(
         {
             "math": {
-                "command": "python",
+                "command": "python3",
                 "args": [math_server_path],
                 "transport": "stdio",
             }
@@ -165,3 +274,80 @@ async def test_get_prompt():
     assert isinstance(messages[0], AIMessage)
     assert "You are a helpful assistant" in messages[0].content
     assert "math, addition, multiplication" in messages[0].content
+
+
+async def test_get_resources_from_all_servers():
+    """Test that get_resources loads resources from all servers."""
+    current_dir = Path(__file__).parent
+    math_server_path = os.path.join(current_dir, "servers/math_server.py")
+    weather_server_path = os.path.join(current_dir, "servers/weather_server.py")
+
+    client = MultiServerMCPClient(
+        {
+            "math": {
+                "command": "python3",
+                "args": [math_server_path],
+                "transport": "stdio",
+            },
+            "weather": {
+                "command": "python3",
+                "args": [weather_server_path],
+                "transport": "stdio",
+            },
+        },
+    )
+
+    # Get all resources from all servers (no server_name specified)
+    all_resources = await client.get_resources()
+
+    # Should have resources from both servers
+    assert len(all_resources) == 2
+    assert all(isinstance(r, Blob) for r in all_resources)
+
+    # Verify we have resources from both servers
+    resource_uris = {str(r.metadata["uri"]) for r in all_resources}
+    assert resource_uris == {"math://formulas", "weather://forecast"}
+
+    # Verify resource content
+    math_resource = next(
+        r for r in all_resources if str(r.metadata["uri"]) == "math://formulas"
+    )
+    weather_resource = next(
+        r for r in all_resources if str(r.metadata["uri"]) == "weather://forecast"
+    )
+    assert math_resource.data == "E = mc^2"
+    assert weather_resource.data == "Sunny with a chance of clouds"
+
+
+async def test_get_resources_from_specific_server():
+    """Test that get_resources loads resources from a specific server."""
+    current_dir = Path(__file__).parent
+    math_server_path = os.path.join(current_dir, "servers/math_server.py")
+    weather_server_path = os.path.join(current_dir, "servers/weather_server.py")
+
+    client = MultiServerMCPClient(
+        {
+            "math": {
+                "command": "python3",
+                "args": [math_server_path],
+                "transport": "stdio",
+            },
+            "weather": {
+                "command": "python3",
+                "args": [weather_server_path],
+                "transport": "stdio",
+            },
+        },
+    )
+
+    # Get resources from math server only
+    math_resources = await client.get_resources(server_name="math")
+    assert len(math_resources) == 1
+    assert str(math_resources[0].metadata["uri"]) == "math://formulas"
+    assert math_resources[0].data == "E = mc^2"
+
+    # Get resources from weather server only
+    weather_resources = await client.get_resources(server_name="weather")
+    assert len(weather_resources) == 1
+    assert str(weather_resources[0].metadata["uri"]) == "weather://forecast"
+    assert weather_resources[0].data == "Sunny with a chance of clouds"
